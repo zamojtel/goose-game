@@ -59,14 +59,44 @@ class PlannerAgentImpl(PlannerAgent):
     ) -> None:
         super().__init__(client, used_model, env, agents, append_to_chat)
         self._append_to_chat(f"Initialized planner for level: {env.level_name}.")
+        self.history = []
 
     def step(self) -> None:
         self._append_to_chat("Planner step executed.")
+        messages = [
+            {
+                "role" : "system",
+                "content" : "You are the planner agent coordinating two geese to solve a goose game. "
+                            "Based on the task description and history, propose the next instruction for each goose. "
+                            "Return only JSON object with two keys 'goose_1' and 'goose_2', and string values containing their next instructions. "
+                            "Provide only JSON no extra text or formatting. "
+            },
+            {
+                "role" : "user",
+                "content": f"Task description: {self._env.task_description}\n"
+                           f"History of moves: {self.history}\n"
+            }
+        ]
+
+        response = self._client.chat.completions.create(
+            model=self._used_model,
+            messages=messages,
+        )
+
+        try:
+            parsed_data = json.loads(response.choices[0].message.content)
+        except json.decoder.JSONDecodeError:
+            self._append_to_chat("Error while parsing message")
+            return
+
         for goose_id, goose in sorted(self._agents.items()):
-            task = GooseAgentMessage(description=f"{goose_id}, honk now.")
+            description = f"{goose_id} : {parsed_data[goose_id]} "
+            task = GooseAgentMessage(description=description)
             self._append_to_chat(f"Calling {goose_id}.")
             result = goose.on_call(task)
+
             if result.error is not None:
                 self._append_to_chat(f"{goose_id} error: {result.error}")
             else:
                 self._append_to_chat(f"{goose_id} result: {result.output}")
+                self.history.append(f"{goose_id} : {result.output}")
