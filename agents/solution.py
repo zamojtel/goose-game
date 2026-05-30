@@ -97,13 +97,22 @@ class PlannerAgentImpl(PlannerAgent):
                             # - it's a wall
                             . - it's an empty field
                             * - it's a target (goal)
-                            
+                            1 - Goose 1
+                            2 - Goose 2
+                    
                             Game rules:
-                            1. Geese can and sometimes must stand on the same field at the same time.
-                            2. The only allowed commands that you can generate are: up, down, left, right and honk.
-                            
-                            Strategy:
-                            When creating your plan in the 'thought' key, you must rely only on the instructions and goals provided in the 'Task description'.
+                            1. Geese can and sometimes must stand on the same tile at the same time.
+                            2. The only allowed commands you can generate are: up, down, left, right, and honk.
+                            3. PHYSICS: Geese CANNOT move through walls (#) or closed doors ($).
+                            4. WAITING: If a goose needs to safely wait in its current position (e.g., to hold a button for the other goose to pass through a door), it MUST use the "honk" command to skip its turn without moving.
+                    
+                            Strategy for your 'thought' process:
+                            When creating your plan in the 'thought' key, you MUST rely on the 'Task description' and strictly follow these exact steps before deciding on the final commands:
+                            Step 1. Task Analysis: What is the current goal based on the 'Task description'?
+                            Step 2. Locate: Find the exact positions of Goose 1, Goose 2, and the key objects (@, $, /, *) on the map.
+                            Step 3. Check Surroundings: Look at the tiles directly UP, DOWN, LEFT, and RIGHT of each goose. 
+                            Step 4. Obstacle Check: Ensure your planned moves do not lead into a wall (#) or a closed door ($).
+                            Step 5. Action: Select exactly ONE valid command for Goose 1 and Goose 2 based on the analysis above.
                             """
             },
             {
