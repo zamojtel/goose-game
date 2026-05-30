@@ -39,8 +39,8 @@ class GooseAgentImpl(GooseAgent):
                 )
                 break
             except Exception:
-                self._append_to_chat("Reached API limit. Awaiting 30 seconds...")
-                time.sleep(30)
+                self._append_to_chat("Reached API limit. Awaiting 10 seconds...")
+                time.sleep(10)
 
         try:
             clean_text = response.choices[0].message.content.replace("```json", "").replace("```", "").strip()
@@ -83,15 +83,33 @@ class PlannerAgentImpl(PlannerAgent):
         messages = [
             {
                 "role" : "system",
-                "content" : "You are the planner agent coordinating two geese to solve a goose game. "
-                            "Based on the task description and history, propose the next instruction for each goose. "
-                            "Return only JSON object with two keys 'goose_1' and 'goose_2' and string values containing their next instructions. "
-                            "Provide only JSON no extra text or formatting. "
+                "content" : """You are the planner agent coordinating two geese to solve a goose game.
+                            Based on the task description and history, propose the next instruction for each goose.
+                            Return only JSON object with exactly three keys: 
+                            'thought' (where you analyze the board, positions of the geese, and plan the next steps step-by-step),
+                            'goose_1' and 'goose_2' with string values containing their next instructions. 
+                            Provide only JSON no extra text or formatting.
+                            
+                            How to understand different symbols:
+                            @ - it's a button
+                            $ - it's a closed door
+                            / - it's an open door
+                            # - it's a wall
+                            . - it's an empty field
+                            * - it's a target (goal)
+                            
+                            Game rules:
+                            1. Geese can and sometimes must stand on the same field at the same time.
+                            2. The only allowed commands that you can generate are: up, down, left, right and honk.
+                            
+                            Strategy:
+                            When creating your plan in the 'thought' key, you must rely only on the instructions and goals provided in the 'Task description'.
+                            """
             },
             {
                 "role" : "user",
                 "content": f"Task description: {self._env.task_description}\n"
-                           f"History of moves: {self.history}\n"
+                           f"History of moves: {self.history[-6:]}\n"
             }
         ]
 
@@ -103,8 +121,8 @@ class PlannerAgentImpl(PlannerAgent):
                 )
                 break
             except Exception:
-                self._append_to_chat("Reached API limit. Awaiting 30 seconds...")
-                time.sleep(30)
+                self._append_to_chat("Reached API limit. Awaiting 10 seconds...")
+                time.sleep(10)
 
         try:
             clean_text = response.choices[0].message.content.replace("```json", "").replace("```", "").strip()
