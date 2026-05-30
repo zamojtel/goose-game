@@ -39,8 +39,8 @@ class GooseAgentImpl(GooseAgent):
                 )
                 break
             except Exception:
-                self._append_to_chat("Reached API limit. Awaiting 10 seconds...")
-                time.sleep(10)
+                self._append_to_chat("Reached API limit. Awaiting 30 seconds...")
+                time.sleep(30)
 
         try:
             clean_text = response.choices[0].message.content.replace("```json", "").replace("```", "").strip()
@@ -97,8 +97,8 @@ class PlannerAgentImpl(PlannerAgent):
                             # - it's a wall
                             . - it's an empty field
                             * - it's a target (goal)
-                            1 - Goose 1
-                            2 - Goose 2
+                            X - Goose 1
+                            Y - Goose 2
                     
                             Game rules:
                             1. Geese can and sometimes must stand on the same tile at the same time.
@@ -130,8 +130,8 @@ class PlannerAgentImpl(PlannerAgent):
                 )
                 break
             except Exception:
-                self._append_to_chat("Reached API limit. Awaiting 10 seconds...")
-                time.sleep(10)
+                self._append_to_chat("Reached API limit. Awaiting 30 seconds...")
+                time.sleep(30)
 
         try:
             clean_text = response.choices[0].message.content.replace("```json", "").replace("```", "").strip()
