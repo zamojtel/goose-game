@@ -1,7 +1,10 @@
-from openai import OpenAI
+from openai import OpenAI, OpenAIError
+from pandas.core.methods import describe
 
 from agents.base import ChatCallback, GooseAgent, GooseAgentMessage, GooseAgentResult, PlannerAgent
 from goose_game.environment import GooseEnvironment, PlannerEnvironment
+
+import json
 
 
 class GooseAgentImpl(GooseAgent):
@@ -11,11 +14,39 @@ class GooseAgentImpl(GooseAgent):
 
     def on_call(self, message: GooseAgentMessage) -> GooseAgentResult:
         self._append_to_chat(f"Planner message: {message.description}")
-        event = self._env.honk(count=1)
-        result = f"{self._env.goose_id} honked at {event.position}."
-        self._append_to_chat(result)
-        return GooseAgentResult(output=result)
 
+        messages = [
+            {
+                "role" : "system",
+                "content" : "You are an agent. Return only messages in JSON format without unnecessary text."
+            },
+            {
+                "role": "user",
+                "content":
+                    f"{message.description}\n"
+                    +
+                    f"Map\n {self._env.describe_state()}\n"
+            }
+        ]
+
+        response = self._client.chat.completions.create(
+            model = self._used_model,
+            messages = messages
+        )
+
+        try:
+            parsed_data = json.loads(response.choices[0].message.content)
+        except json.decoder.JSONDecodeError:
+            return GooseAgentResult(output=f"Error while parsing message")
+
+        if parsed_data["action"] == "move":
+            boolean = self._env.move(parsed_data["arg"])
+            result = f"Move was { 'made' if boolean else 'not made ' } in direction {parsed_data['arg']}!"
+        else:
+            event = self._env.honk(parsed_data["arg"])
+            result = f"{self._env.goose_id} honked at {event.position}."
+
+        return GooseAgentResult(output=result)
 
 class PlannerAgentImpl(PlannerAgent):
     def __init__(
