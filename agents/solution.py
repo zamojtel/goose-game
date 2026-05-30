@@ -126,11 +126,12 @@ class PlannerAgentImpl(PlannerAgent):
             try:
                 response = self._client.chat.completions.create(
                     model=self._used_model,
-                    messages=messages,
+                    messages=messages
                 )
                 break
-            except Exception:
-                self._append_to_chat("Reached API limit. Awaiting 30 seconds...")
+            except Exception as e:
+                self._append_to_chat(f"API Error: {str(e)}")
+                self._append_to_chat("Awaiting 30 seconds...")
                 time.sleep(30)
 
         try:
