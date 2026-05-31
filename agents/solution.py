@@ -1,13 +1,9 @@
-from openai import OpenAI, OpenAIError
-from pandas.core.methods import describe
-from streamlit.string_util import clean_text
-
+import json
 import time
+
+from openai import OpenAI
 from agents.base import ChatCallback, GooseAgent, GooseAgentMessage, GooseAgentResult, PlannerAgent
 from goose_game.environment import GooseEnvironment, PlannerEnvironment
-
-import json
-
 
 class GooseAgentImpl(GooseAgent):
     def __init__(self, client: OpenAI, used_model: str, env: GooseEnvironment, append_to_chat: ChatCallback) -> None:
@@ -38,7 +34,9 @@ class GooseAgentImpl(GooseAgent):
         if action == "move":
             success = self._env.move(arg)
             if success:
-                result = f"Moved {arg} -> SUCCESS"
+                visible_geese = self._env.visible_goose_positions()
+                pos = visible_geese.get(self._env.goose_id, "unknown")
+                result = f"Moved {arg} -> SUCCESS (now at {pos})"
             else:
                 result = f"Moved {arg} -> FAILED (Blocked by wall # or closed door $)"
         else:
@@ -60,14 +58,14 @@ class PlannerAgentImpl(PlannerAgent):
         self._append_to_chat(f"Initialized planner for level: {env.level_name}.")
         self.history = []
 
+        self.last_thought = "First turn, no previous thoughts."
+
     def step(self) -> None:
         self._append_to_chat("Planner step executed.")
 
-        # Pobieramy aktualny obraz mapy PRZED zaplanowaniem ruchów
         obs_1 = self._agents["goose_1"].on_call(GooseAgentMessage(description="observe")).output
         obs_2 = self._agents["goose_2"].on_call(GooseAgentMessage(description="observe")).output
 
-        # ZWIĘKSZAMY PAMIĘĆ do 16 ostatnich akcji, by uniknąć amnezji fałszywych przycisków!
         history_text = "\n".join(self.history[-16:]) if self.history else "First turn - no moves yet."
 
         messages = [
@@ -75,10 +73,19 @@ class PlannerAgentImpl(PlannerAgent):
                 "role": "system",
                 "content": """You are the Planner Agent coordinating two geese (Goose 1 and Goose 2) to solve an unknown grid-based puzzle.
                 You do NOT know the level mechanics in advance. You must deduce them dynamically based on the task description, map state, and history.
-                Return ONLY a valid JSON object with exactly three keys: 
-                'thought' (step-by-step analysis and deduction of the current state),
-                'goose_1' and 'goose_2' with string values containing their next instructions. 
-                Provide only JSON, no markdown formatting (do not use ```json blocks).
+
+                CRITICAL OUTPUT FORMAT:
+                You MUST return ONLY a valid JSON object matching EXACTLY this structure. Do not add markdown or text outside the JSON.
+                {
+                  "thought": {
+                    "door_status": "Is the door closed ($) or open (/)?",
+                    "goose_1_analysis": "Where is Goose 1? What is it doing?",
+                    "goose_2_analysis": "Where is Goose 2? What is it doing?",
+                    "anti_loop_and_memory": "Check RECENT ACTION HISTORY and YOUR LAST THOUGHT. Which buttons (coordinates) failed? Which direction is forbidden to avoid reversing?"
+                  },
+                  "goose_1": "command (up, down, left, right, or honk)",
+                  "goose_2": "command (up, down, left, right, or honk)"
+                }
 
                 How to understand different symbols:
                 @ - button
@@ -102,19 +109,20 @@ class PlannerAgentImpl(PlannerAgent):
                 - EXPLORATION: In hard mode, if the goal (*) or path is not visible, move towards '?' to uncover the map.
                 - SHARED VISION: In hard mode, one goose might not see the door. You MUST combine both Goose 1 and Goose 2 views to check if a door is open (/).
                 - TESTING BUTTONS: If a goose is blocked by a closed door ($), the helper goose must step on buttons (@) to test them. Use 'honk' to stay on the button and observe. 
-                - MEMORY: Check the action history! If the helper stepped on a button and the door remained closed ($) in the next turn, it's the WRONG button. The helper must step off and find a DIFFERENT button. DO NOT test the same wrong button twice!
+                - MEMORY: Check the action history and YOUR LAST THOUGHT! If the helper stepped on a button (check coordinates) and the door remained closed ($) in the next turn, it's the WRONG button. The helper must step off and find a DIFFERENT button. DO NOT test the same wrong button twice!
                 - HOLDING & CROSSING (CRITICAL PHASE): If the door is OPEN (/), the helper has found the CORRECT button! The helper MUST output 'honk' every turn to stay on the button and keep the door open. The blocked goose MUST immediately WALK INTO the open door (move onto the '/' tile). DO NOT HESITATE!
                 - RELEASING: Once the blocked goose has crossed the door, it is safe! The helper MUST leave the button and go to its own goal (*). Ignore the door closing ($) behind the safe goose.
                 - NO BACKTRACKING: Once a goose walks through a door, it must NEVER walk back through it.
+                - FINISHING: Both geese must reach the goal (*) and honk.
 
                 Strategy for your 'thought' process:
                 When creating your plan in the 'thought' key, you MUST strictly follow these exact steps:
                 Step 1. Locate: Find X, Y, @, /, $, and *. Check BOTH views! Is there an open door (/)?
-                Step 2. Status Check: Who is blocked? Who is helping? Which buttons have been tested and failed (check the history)?
+                Step 2. Status Check: Who is blocked? Who is helping? Which buttons have been tested and failed (check the history and YOUR LAST THOUGHT for coordinates)?
                 Step 3. Door Action: If the door is OPEN (/), the helper MUST 'honk', and the blocked goose MUST move towards and INTO the '/' tile.
                 Step 4. Surrounding Scan: For each moving goose, state what symbol is DIRECTLY adjacent: UP, DOWN, LEFT, RIGHT. (Remember: '/' is walkable!).
                 Step 5. Anti-Loop: Plan the route avoiding '#' and '$'. DO NOT reverse your previous move. NEVER bounce between the same tiles.
-                Step 6. Action: Select ONE valid command for Goose 1 and Goose 2.
+                Step 6. Action: Select ONE valid command for Goose 1 and Goose 2 based on the JSON schema.
                 """
             },
             {
@@ -123,11 +131,12 @@ class PlannerAgentImpl(PlannerAgent):
                     f"Task description: {self._env.task_description}\n\n"
                     f"--- GOOSE 1 VIEW ---\n{obs_1}\n\n"
                     f"--- GOOSE 2 VIEW ---\n{obs_2}\n\n"
+                    # DODATEK 3: Przesyłamy modelowi jego własne myśli z poprzedniej tury
+                    f"--- YOUR LAST THOUGHT (MEMORY) ---\n{json.dumps(self.last_thought)}\n\n"
                     f"--- RECENT ACTION HISTORY ---\n{history_text}\n"
             }
         ]
 
-        # Bezpieczne 8 sekund opóźnienia, by uniknąć błędu 429
         time.sleep(8)
 
         try:
@@ -147,6 +156,9 @@ class PlannerAgentImpl(PlannerAgent):
             if start != -1 and end != -1:
                 clean_text = clean_text[start:end + 1]
             parsed_data = json.loads(clean_text)
+
+            if isinstance(parsed_data, dict) and "thought" in parsed_data:
+                self.last_thought = parsed_data["thought"]
 
             if not isinstance(parsed_data, dict):
                 self._append_to_chat("Warning: LLM returned invalid structure. Defaulting to honk.")
@@ -171,98 +183,3 @@ class PlannerAgentImpl(PlannerAgent):
                 turn_logs.append(f"{goose_id}: {result.output}")
 
         self.history.append(" | ".join(turn_logs))
-
-    # def step(self) -> None:
-    #     self._append_to_chat("Planner step executed.")
-    #     messages = [
-    #         {
-    #             "role" : "system",
-    #             "content":
-    #                 """You are the Planner Agent coordinating two geese (Goose 1 and Goose 2) to solve an unknown grid-based puzzle.
-    #                 You do NOT know the level mechanics in advance. You must deduce them dynamically based on the task description, map state, and history.
-    #                 Return ONLY a valid JSON object with exactly three keys:
-    #                 'thought' (step-by-step analysis and deduction of the current state),
-    #                 'goose_1' and 'goose_2' with string values containing their next instructions.
-    #                 Provide only JSON, no markdown formatting (do not use ```json blocks).
-    #
-    #                 How to understand different symbols:
-    #                 @ - button
-    #                 $ - closed door
-    #                 / - open door
-    #                 # - wall
-    #                 . - empty field
-    #                 * - target (goal)
-    #                 ? - unknown area (unexplored map in hard mode)
-    #                 X - Goose 1
-    #                 Y - Goose 2
-    #
-    #                 Game rules & Physics:
-    #                 1. OVERLAPPING (CRITICAL): The text map shows only one symbol per tile. If a goose is on a button or goal, its letter (X or Y) covers the '@' or '*'. If you cannot find 'X' or 'Y' on the map, it means that goose is safely on the goal or a button! Do not panic.
-    #                 2. ALLOWED COMMANDS: up, down, left, right, and honk.
-    #                 3. PHYSICS: Geese CANNOT move through walls (#), closed doors ($), or outside the map boundaries.
-    #                 4. WAITING: Use "honk" to stay in place without moving (e.g., to hold a button or wait for a door to open).
-    #
-    #                 Universal Cooperation & Discovery Strategy (Applies to all levels):
-    #                 - EXPLORATION: In hard mode, the map is partially hidden (?). If the goal (*) or path is not visible, move towards '?' to explore and discover the map.
-    #                 - DISCOVERY: Button-door wiring is unknown. If one goose is blocked by a closed door ($), the other goose must explore to find and step on buttons (@) to see which one opens the door.
-    #                 - COOPERATION: To test a button, the helper goose stands on it and uses 'honk'. The blocked goose waits and observes. If the door opens (/), the blocked goose passes through. If not, the helper must find another button.
-    #                 - RELEASING: Once the blocked goose has safely passed the door or reached the goal (*), the helper goose MUST stop holding the button and immediately proceed to its own goal. It is completely fine if the door closes ($) behind the safe goose!
-    #                 - FINISHING: Both geese must reach the goal (*) and honk.
-    #
-    #                 Strategy for your 'thought' process:
-    #                 When creating your plan in the 'thought' key, you MUST strictly follow these exact steps:
-    #                 Step 1. Map Coordinates: Count the rows (top to bottom) and columns (left to right). Locate X, Y, @, /, $, and *. If X or Y is missing, they are on a button or the goal.
-    #                 Step 2. Status Check: Who is blocked? Who is helping? Is the door open (/) or closed ($)?
-    #                 Step 3. Surrounding Scan (CRITICAL): For each moving goose, look at the map and explicitly state what symbol is DIRECTLY adjacent to it:
-    #                    - UP: [symbol]
-    #                    - DOWN: [symbol]
-    #                    - LEFT: [symbol]
-    #                    - RIGHT: [symbol]
-    #                 Step 4. Collision & Anti-Loop: You CANNOT move into '#' or '$'. If your desired direction (e.g., left towards the goal) is blocked by '#', you MUST choose a different open path ('.', '/') to walk around the wall. Do not reverse your previous move.
-    #                 Step 5. Action: Select ONE valid command for Goose 1 and Goose 2.
-    #                 """
-    #         },
-    #         {
-    #             "role" : "user",
-    #             "content":
-    #                 f"Task description: {self._env.task_description}\n"
-    #                 f"History of moves: {self.history[-6:]}\n"
-    #         }
-    #     ]
-    #
-    #     time.sleep(8)
-    #
-    #     try:
-    #         response = self._client.chat.completions.create(
-    #             model=self._used_model,
-    #             messages=messages
-    #         )
-    #     except Exception as e:
-    #         self._append_to_chat(f"Krytyczny błąd API: {str(e)}")
-    #         self._append_to_chat("Zatrzymuję program, aby nie marnować limitu zapytań!")
-    #         raise RuntimeError(f"Przerywam działanie workflow z powodu błędu API: {str(e)}")
-    #
-    #     try:
-    #         clean_text = response.choices[0].message.content.replace("```json", "").replace("```", "").strip()
-    #         parsed_data = json.loads(clean_text)
-    #
-    #         if not isinstance(parsed_data, dict):
-    #             self._append_to_chat("Warning: LLM returned invalid structure. Defaulting to honk.")
-    #             parsed_data = {"goose_1": "honk", "goose_2": "honk"}
-    #
-    #     except Exception:
-    #         self._append_to_chat("Error while parsing message. Defaulting to honk.")
-    #         parsed_data = {"goose_1": "honk", "goose_2": "honk"}
-    #
-    #     for goose_id, goose in sorted(self._agents.items()):
-    #         action_text = parsed_data.get(goose_id, "honk")
-    #         description = f"{goose_id} : {action_text} "
-    #         task = GooseAgentMessage(description=description)
-    #         self._append_to_chat(f"Calling {goose_id}.")
-    #         result = goose.on_call(task)
-    #
-    #         if result.error is not None:
-    #             self._append_to_chat(f"{goose_id} error: {result.error}")
-    #         else:
-    #             self._append_to_chat(f"{goose_id} result: {result.output}")
-    #             self.history.append(f"{goose_id} : {result.output}")
