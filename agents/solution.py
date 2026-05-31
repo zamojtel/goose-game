@@ -5,6 +5,7 @@ from openai import OpenAI
 from agents.base import ChatCallback, GooseAgent, GooseAgentMessage, GooseAgentResult, PlannerAgent
 from goose_game.environment import GooseEnvironment, PlannerEnvironment
 
+
 class GooseAgentImpl(GooseAgent):
     def __init__(self, client: OpenAI, used_model: str, env: GooseEnvironment, append_to_chat: ChatCallback) -> None:
         super().__init__(client, used_model, env, append_to_chat)
@@ -29,36 +30,39 @@ class GooseAgentImpl(GooseAgent):
         elif "honk" in text:
             action, arg = "honk", 1
         else:
-            return GooseAgentResult(error=f"Error while parsing message: {message.description}")
+            return GooseAgentResult(error=f"Error parsing message: {message.description}")
 
         if action == "move":
             success = self._env.move(arg)
             if success:
-                visible_geese = self._env.visible_goose_positions()
-                pos = visible_geese.get(self._env.goose_id, "unknown")
-                result = f"Moved {arg} -> SUCCESS (now at {pos})"
+                result = f"Moved {arg} -> SUCCESS"
             else:
-                result = f"Moved {arg} -> FAILED (Blocked by wall # or closed door $)"
+                result = f"Moved {arg} -> FAILED (Blocked)"
         else:
             event = self._env.honk(arg)
-            result = f"Honked at {event.position}"
+            result = f"Honked -> SUCCESS"
 
         return GooseAgentResult(output=result)
 
+
 class PlannerAgentImpl(PlannerAgent):
-    def __init__(
-        self,
-        client: OpenAI,
-        used_model: str,
-        env: PlannerEnvironment,
-        agents: dict[str, GooseAgent],
-        append_to_chat: ChatCallback,
-    ) -> None:
+    def __init__(self, client: OpenAI, used_model: str, env: PlannerEnvironment, agents: dict[str, GooseAgent],
+                 append_to_chat: ChatCallback):
         super().__init__(client, used_model, env, agents, append_to_chat)
         self._append_to_chat(f"Initialized planner for level: {env.level_name}.")
         self.history = []
 
-        self.last_thought = "First turn, no previous thoughts."
+        # OSTATECZNA PAMIĘĆ AGENTA - Śledzenie odwiedzonych ścieżek
+        self.last_thought = {
+            "visited_1": [], "visited_2": [],
+            "dud_buttons": [],
+            "g1_last_cmd": None, "g2_last_cmd": None,
+            "blocked_1": False, "blocked_2": False
+        }
+
+        self.known_buttons = set()
+        self.known_doors = set()
+        self.known_goals = set()
 
     def step(self) -> None:
         self._append_to_chat("Planner step executed.")
@@ -66,120 +70,184 @@ class PlannerAgentImpl(PlannerAgent):
         obs_1 = self._agents["goose_1"].on_call(GooseAgentMessage(description="observe")).output
         obs_2 = self._agents["goose_2"].on_call(GooseAgentMessage(description="observe")).output
 
-        history_text = "\n".join(self.history[-16:]) if self.history else "First turn - no moves yet."
+        pos_1 = pos_2 = None
+        grid_map = {}
+        open_doors = set()
+        closed_doors = set()
+
+        # 1. PARSOWANIE MAPY DO PAMIĘCI ABSOLUTNEJ
+        for obs in [obs_1, obs_2]:
+            lines = obs.strip().split('\n')
+            for r, line in enumerate(lines):
+                for c, char in enumerate(line):
+                    if char != '?':
+                        if char == 'X':
+                            pos_1 = (r, c)
+                        elif char == 'Y':
+                            pos_2 = (r, c)
+                        elif char == '@':
+                            self.known_buttons.add((r, c))
+                        elif char == '*':
+                            self.known_goals.add((r, c))
+                        elif char == '/':
+                            self.known_doors.add((r, c))
+                            open_doors.add((r, c))
+                        elif char == '$':
+                            self.known_doors.add((r, c))
+                            closed_doors.add((r, c))
+                        grid_map[(r, c)] = char
+
+        # 2. NAPRAWA OKLUZJI (Przywracanie znaków spod kaczek)
+        if pos_1 and pos_1 in self.known_doors: open_doors.add(pos_1); grid_map[pos_1] = '/'
+        if pos_2 and pos_2 in self.known_doors: open_doors.add(pos_2); grid_map[pos_2] = '/'
+        if pos_1 in closed_doors: closed_doors.remove(pos_1)
+        if pos_2 in closed_doors: closed_doors.remove(pos_2)
+        if pos_1 and pos_1 in self.known_buttons: grid_map[pos_1] = '@'
+        if pos_2 and pos_2 in self.known_buttons: grid_map[pos_2] = '@'
+        if pos_1 and pos_1 in self.known_goals: grid_map[pos_1] = '*'
+        if pos_2 and pos_2 in self.known_goals: grid_map[pos_2] = '*'
+
+        # 3. SILNIK EKSPLORACJI (DFS)
+        visited_1 = self.last_thought.get("visited_1", [])
+        visited_2 = self.last_thought.get("visited_2", [])
+
+        if pos_1 and list(pos_1) not in visited_1: visited_1.append(list(pos_1))
+        if pos_2 and list(pos_2) not in visited_2: visited_2.append(list(pos_2))
+
+        def get_moves(pos, visited):
+            if not pos: return []
+            r, c = pos
+            valid = []
+            for d, dr, dc in [("up", -1, 0), ("down", 1, 0), ("left", 0, -1), ("right", 0, 1)]:
+                nr, nc = r + dr, c + dc
+                if grid_map.get((nr, nc), '#') not in ['#', '$']:
+                    if [nr, nc] in visited:
+                        valid.append(f"{d} (visited)")
+                    else:
+                        valid.append(d)
+            return valid
+
+        moves_1 = get_moves(pos_1, visited_1)
+        moves_2 = get_moves(pos_2, visited_2)
+
+        # 4. DETEKTOR ŚCIAN I DRZWI
+        def is_blocked(pos, moves):
+            if not pos: return False
+            if any("(visited)" not in m for m in moves): return False
+            r, c = pos
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                if grid_map.get((r + dr, c + dc)) == '$': return True
+            return False
+
+        blocked_1 = is_blocked(pos_1, moves_1)
+        blocked_2 = is_blocked(pos_2, moves_2)
+
+        was_blocked_1 = self.last_thought.get("blocked_1", False)
+        was_blocked_2 = self.last_thought.get("blocked_2", False)
+        duds = self.last_thought.get("dud_buttons", [])
+
+        # MAGICZNY RESET: Gdy nowa gęś utknie pod nowymi drzwiami, czyścimy historię guzików dla drugiej gęsi!
+        if blocked_1 and not was_blocked_1:
+            duds = []
+            visited_2 = [list(pos_2)] if pos_2 else []
+        if blocked_2 and not was_blocked_2:
+            duds = []
+            visited_1 = [list(pos_1)] if pos_1 else []
+
+        on_btn_1 = pos_1 in self.known_buttons
+        on_btn_2 = pos_2 in self.known_buttons
+        g1_last_cmd = self.last_thought.get("g1_last_cmd")
+        g2_last_cmd = self.last_thought.get("g2_last_cmd")
+
+        # AUTO-DETEKCJA FAŁSZYWYCH GUZIKÓW
+        if on_btn_1 and g1_last_cmd == "honk" and not open_doors and list(pos_1) not in duds:
+            duds.append(list(pos_1))
+        if on_btn_2 and g2_last_cmd == "honk" and not open_doors and list(pos_2) not in duds:
+            duds.append(list(pos_2))
+
+        on_dud_1 = list(pos_1) in duds if pos_1 else False
+        on_dud_2 = list(pos_2) in duds if pos_2 else False
+        at_goal_1 = pos_1 in self.known_goals
+        at_goal_2 = pos_2 in self.known_goals
+
+        facts = "--- GAME ENGINE FACTS ---\n"
+        facts += f"Goose 1 | Blocked by door? {'YES' if blocked_1 else 'NO'} | On button? {'YES' if on_btn_1 else 'NO'} (Is DUD? {'YES' if on_dud_1 else 'NO'}) | At goal? {'YES' if at_goal_1 else 'NO'} | Moves: {moves_1}\n"
+        facts += f"Goose 2 | Blocked by door? {'YES' if blocked_2 else 'NO'} | On button? {'YES' if on_btn_2 else 'NO'} (Is DUD? {'YES' if on_dud_2 else 'NO'}) | At goal? {'YES' if at_goal_2 else 'NO'} | Moves: {moves_2}\n"
+        facts += f"Any open doors? {'YES' if open_doors else 'NO'}\n"
 
         messages = [
             {
                 "role": "system",
-                "content": """You are the Planner Agent coordinating two geese (Goose 1 and Goose 2) to solve an unknown grid-based puzzle.
-                You do NOT know the level mechanics in advance. You must deduce them dynamically based on the task description, map state, and history.
+                "content": """You are the Planner Agent coordinating Goose 1 and Goose 2.
+Read the GAME ENGINE FACTS and apply these strict rules to choose the commands.
 
-                CRITICAL OUTPUT FORMAT:
-                You MUST return ONLY a valid JSON object matching EXACTLY this structure. Do not add markdown or text outside the JSON.
-                {
-                  "thought": {
-                    "door_status": "Is the door closed ($) or open (/)?",
-                    "goose_1_analysis": "Where is Goose 1? What is it doing?",
-                    "goose_2_analysis": "Where is Goose 2? What is it doing?",
-                    "anti_loop_and_memory": "Check RECENT ACTION HISTORY and YOUR LAST THOUGHT. Which buttons (coordinates) failed? Which direction is forbidden to avoid reversing?"
-                  },
-                  "goose_1": "command (up, down, left, right, or honk)",
-                  "goose_2": "command (up, down, left, right, or honk)"
-                }
+RULES (Apply in order from 1 to 6):
+1. AT GOAL: If a goose is 'At goal? YES', it MUST output 'honk'.
+2. BLOCKED: If a goose is 'Blocked by door? YES', it MUST output 'honk'. (Wait for the other goose to open it).
+3. HOLDING BUTTON: If 'On button? YES', AND 'Any open doors? YES', AND the other goose is NOT 'Blocked by door? YES', YOU MUST 'honk' to keep the door open!
+4. TESTING BUTTON: If 'On button? YES', AND 'Is DUD? NO', AND 'Any open doors? NO', output 'honk' to test it.
+5. USELESS BUTTON: If 'On button? YES', but it 'Is DUD? YES', OR the other goose IS 'Blocked by door? YES' (meaning they reached a new closed door), you MUST LEAVE the button (choose a move from Moves).
+6. EXPLORING: If none of the above apply, choose a move from 'Moves'. 
+   - ALWAYS prefer moves WITHOUT '(visited)'. 
+   - Only choose a '(visited)' move if ALL available moves are visited (dead end backtrack).
 
-                How to understand different symbols:
-                @ - button
-                $ - closed door
-                / - open door
-                # - wall
-                . - empty field
-                * - target (goal)
-                ? - unknown area (unexplored map in hard mode)
-                X - Goose 1
-                Y - Goose 2
+OUTPUT FORMAT (Strict JSON):
+{
+  "thought": {
+    "g1_logic": "Rule applied for Goose 1",
+    "g2_logic": "Rule applied for Goose 2"
+  },
+  "goose_1": "command (up, down, left, right, or honk)",
+  "goose_2": "command (up, down, left, right, or honk)"
+}
 
-                Game rules & Physics:
-                1. OVERLAPPING (CRITICAL): The text map shows only one symbol per tile. If a goose is on a button or goal, its letter (X or Y) covers the '@' or '*'. If you cannot find 'X' or 'Y' on the map, it means that goose is safely on the goal or a button! Do not panic.
-                2. ALLOWED COMMANDS: up, down, left, right, and honk.
-                3. WALKABLE TILES (CRITICAL): Geese CAN walk onto empty fields (.), buttons (@), OPEN DOORS (/), goals (*), and unknown areas (?). The symbol '/' is NOT an obstacle! It is a safe floor tile. You CAN and MUST move directly into the '/' symbol to pass through the door!
-                4. PHYSICS: Geese CANNOT move through walls (#) or closed doors ($).
-                5. WAITING: Use "honk" to stay in place without moving.
-
-                Universal Cooperation & Discovery Strategy (Applies to all levels):
-                - EXPLORATION: In hard mode, if the goal (*) or path is not visible, move towards '?' to uncover the map.
-                - SHARED VISION: In hard mode, one goose might not see the door. You MUST combine both Goose 1 and Goose 2 views to check if a door is open (/).
-                - TESTING BUTTONS: If a goose is blocked by a closed door ($), the helper goose must step on buttons (@) to test them. Use 'honk' to stay on the button and observe. 
-                - MEMORY: Check the action history and YOUR LAST THOUGHT! If the helper stepped on a button (check coordinates) and the door remained closed ($) in the next turn, it's the WRONG button. The helper must step off and find a DIFFERENT button. DO NOT test the same wrong button twice!
-                - HOLDING & CROSSING (CRITICAL PHASE): If the door is OPEN (/), the helper has found the CORRECT button! The helper MUST output 'honk' every turn to stay on the button and keep the door open. The blocked goose MUST immediately WALK INTO the open door (move onto the '/' tile). DO NOT HESITATE!
-                - RELEASING: Once the blocked goose has crossed the door, it is safe! The helper MUST leave the button and go to its own goal (*). Ignore the door closing ($) behind the safe goose.
-                - NO BACKTRACKING: Once a goose walks through a door, it must NEVER walk back through it.
-                - FINISHING: Both geese must reach the goal (*) and honk.
-
-                Strategy for your 'thought' process:
-                When creating your plan in the 'thought' key, you MUST strictly follow these exact steps:
-                Step 1. Locate: Find X, Y, @, /, $, and *. Check BOTH views! Is there an open door (/)?
-                Step 2. Status Check: Who is blocked? Who is helping? Which buttons have been tested and failed (check the history and YOUR LAST THOUGHT for coordinates)?
-                Step 3. Door Action: If the door is OPEN (/), the helper MUST 'honk', and the blocked goose MUST move towards and INTO the '/' tile.
-                Step 4. Surrounding Scan: For each moving goose, state what symbol is DIRECTLY adjacent: UP, DOWN, LEFT, RIGHT. (Remember: '/' is walkable!).
-                Step 5. Anti-Loop: Plan the route avoiding '#' and '$'. DO NOT reverse your previous move. NEVER bounce between the same tiles.
-                Step 6. Action: Select ONE valid command for Goose 1 and Goose 2 based on the JSON schema.
-                """
+NOTE: Output ONLY the pure direction word for commands (e.g., 'left', not 'left (visited)').
+"""
             },
             {
                 "role": "user",
-                "content":
-                    f"Task description: {self._env.task_description}\n\n"
-                    f"--- GOOSE 1 VIEW ---\n{obs_1}\n\n"
-                    f"--- GOOSE 2 VIEW ---\n{obs_2}\n\n"
-                    # DODATEK 3: Przesyłamy modelowi jego własne myśli z poprzedniej tury
-                    f"--- YOUR LAST THOUGHT (MEMORY) ---\n{json.dumps(self.last_thought)}\n\n"
-                    f"--- RECENT ACTION HISTORY ---\n{history_text}\n"
+                "content": facts
             }
         ]
 
-        time.sleep(8)
+        time.sleep(6)
 
         try:
-            response = self._client.chat.completions.create(
-                model=self._used_model,
-                messages=messages
-            )
-        except Exception as e:
-            self._append_to_chat(f"Krytyczny błąd API: {str(e)}")
-            self._append_to_chat("Zatrzymuję program, aby nie marnować limitu zapytań!")
-            raise RuntimeError(f"Przerywam działanie workflow z powodu błędu API: {str(e)}")
-
-        try:
+            response = self._client.chat.completions.create(model=self._used_model, messages=messages)
             clean_text = response.choices[0].message.content.replace("```json", "").replace("```", "").strip()
             start = clean_text.find("{")
             end = clean_text.rfind("}")
-            if start != -1 and end != -1:
-                clean_text = clean_text[start:end + 1]
+            if start != -1 and end != -1: clean_text = clean_text[start:end + 1]
             parsed_data = json.loads(clean_text)
 
-            if isinstance(parsed_data, dict) and "thought" in parsed_data:
-                self.last_thought = parsed_data["thought"]
+            g1_cmd = parsed_data.get("goose_1", "honk").lower().split()[0]
+            g2_cmd = parsed_data.get("goose_2", "honk").lower().split()[0]
 
-            if not isinstance(parsed_data, dict):
-                self._append_to_chat("Warning: LLM returned invalid structure. Defaulting to honk.")
-                parsed_data = {"goose_1": "honk", "goose_2": "honk"}
+            if g1_cmd not in ["up", "down", "left", "right", "honk"]: g1_cmd = "honk"
+            if g2_cmd not in ["up", "down", "left", "right", "honk"]: g2_cmd = "honk"
 
-        except Exception:
-            self._append_to_chat("Error while parsing message. Defaulting to honk.")
-            parsed_data = {"goose_1": "honk", "goose_2": "honk"}
+            self.last_thought["visited_1"] = visited_1
+            self.last_thought["visited_2"] = visited_2
+            self.last_thought["dud_buttons"] = duds
+            self.last_thought["blocked_1"] = blocked_1
+            self.last_thought["blocked_2"] = blocked_2
+            self.last_thought["g1_last_cmd"] = g1_cmd
+            self.last_thought["g2_last_cmd"] = g2_cmd
+
+        except Exception as e:
+            self._append_to_chat(f"API Error: {str(e)}")
+            g1_cmd, g2_cmd = "honk", "honk"
 
         turn_logs = []
-        for goose_id, goose in sorted(self._agents.items()):
-            action_text = parsed_data.get(goose_id, "honk")
-            task = GooseAgentMessage(description=action_text)
+        for goose_id, cmd in [("goose_1", g1_cmd), ("goose_2", g2_cmd)]:
             self._append_to_chat(f"Calling {goose_id}.")
-            result = goose.on_call(task)
+            result = self._agents[goose_id].on_call(GooseAgentMessage(description=cmd))
 
             if result.error is not None:
                 self._append_to_chat(f"{goose_id} error: {result.error}")
-                turn_logs.append(f"{goose_id} tried '{action_text}' -> ERROR")
+                turn_logs.append(f"{goose_id}: ERROR")
             else:
                 self._append_to_chat(f"{goose_id} result: {result.output}")
-                turn_logs.append(f"{goose_id}: {result.output}")
+                turn_logs.append(f"{goose_id}: {cmd}")
 
         self.history.append(" | ".join(turn_logs))
