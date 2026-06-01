@@ -2,6 +2,7 @@ import json
 import re
 import time
 from collections import deque
+from typing import Optional, List, Tuple
 
 from openai import OpenAI
 
@@ -66,7 +67,7 @@ class PlannerAgentImpl(PlannerAgent):
             append_to_chat: ChatCallback,
     ) -> None:
         super().__init__(client, used_model, env, agents, append_to_chat)
-        self._append_to_chat("Planner initialized. Perfect Relational Engine active.")
+        self._append_to_chat("Planner initialized. Relational Engine active.")
         self.global_map = {}
         self.goose_positions = {"goose_1": None, "goose_2": None}
         self.targets = {"goose_1": None, "goose_2": None}
@@ -80,7 +81,6 @@ class PlannerAgentImpl(PlannerAgent):
         self.passed_doors = set()
         self.permanent_goals = set()
         self.permanent_buttons = set()
-
         self.failed_combinations = set()
 
         self.consecutive_stalls = 0
@@ -162,7 +162,7 @@ class PlannerAgentImpl(PlannerAgent):
         elapsed = time.time() - self.last_llm_call
         if elapsed < 4.1:
             time.sleep(4.1 - elapsed)
-        self._append_to_chat("Planner Engine Ping ...")
+        self._append_to_chat("Planner Engine Ping...")
         try:
             self._client.chat.completions.create(
                 model=self._used_model,
@@ -174,7 +174,6 @@ class PlannerAgentImpl(PlannerAgent):
             self.last_llm_call = time.time()
 
     def step(self) -> None:
-
         for gid in ["goose_1", "goose_2"]:
             res = self._agents[gid].on_call(GooseAgentMessage(json.dumps({"cmd": "perceive"})))
             data = json.loads(res.output)
@@ -309,7 +308,7 @@ class PlannerAgentImpl(PlannerAgent):
         self.targets["goose_2"] = t2
 
         if self.consecutive_stalls == 1:
-            self._call_llm("Planner System OK.")
+            self._call_llm("Planner System ping for synchronization.")
 
         action_consumed_this_turn = False
         for gid in ["goose_1", "goose_2"]:
@@ -343,7 +342,6 @@ class PlannerAgentImpl(PlannerAgent):
 
             if data.get("success"):
                 action_consumed_this_turn = True
-
                 if door_pos in self.all_known_doors:
                     self.passed_doors.add(door_pos)
             else:
